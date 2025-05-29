@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-import math
 from typing import Dict, Any
 import torch
 import torch.optim as optim
@@ -9,9 +8,10 @@ import yaml
 from tqdm import tqdm
 import wandb
 
+from utils.summary import print_model_summary
 from datasets.paired import create_train_dataset, create_val_dataset
 from losses import TVLoss, L1Loss
-from models.denoising import DenoisingNet
+from models import DenoisingNet
 from metrics import calculate_batch_psnr
 
 def validate_config(config: Dict[str, Any]) -> None:
@@ -109,13 +109,16 @@ def create_dataloaders(config):
         config['data']['val_dir']['refer']
     )
     
-    # Create dataloaders
+    # Create dataloaders with memory optimizations
     train_loader = data.DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
         num_workers=config['training']['num_workers'],
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True,  # Keep workers alive between epochs
+        prefetch_factor=1,  # Number of batches loaded in advance by each worker
+        drop_last=True  # Drop incomplete batches to avoid memory issues
     )
     
     val_loader = data.DataLoader(
@@ -123,22 +126,28 @@ def create_dataloaders(config):
         batch_size=config['training']['batch_size'],
         shuffle=False,
         num_workers=config['training']['num_workers'],
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=1,
+        drop_last=True
     )
     
     return train_loader, val_loader
 
 def create_model(config):
     """Create and return model"""
+    device = torch.device(config['training']['device'])
     model = DenoisingNet(
         in_channels=config['model']['in_channels'],
         out_channels=config['model']['out_channels'],
         hidden_channels=16,
         scales=[3,5,7,13,17]
     )
+    model = model.to(device)  # Move model to the specified device
     if config['training']['parallel_train']:
         model = torch.nn.DataParallel(model)
-    return model.to(config['training']['device'])
+    print_model_summary(model, device, (config['model']['in_channels'], 512, 512))
+    return model
 
 def create_optimizer(model, config):
     """Create and return optimizer"""
@@ -149,9 +158,10 @@ def create_optimizer(model, config):
 
 def create_loss_functions(config):
     """Create and return loss functions"""
+    device = torch.device(config['training']['device'])
     return {
-        'l1': L1Loss(reduction='mean'),
-        'tv': TVLoss(reduction='mean')
+        'l1': L1Loss(reduction='mean').to(device),
+        'tv': TVLoss(reduction='mean').to(device)
     }
 
 def init_wandb(config: Dict[str, Any]) -> bool:
@@ -164,10 +174,6 @@ def init_wandb(config: Dict[str, Any]) -> bool:
             tags=config['wandb'].get('tags', []),
             notes=config['wandb'].get('notes', '')
         )
-        
-        # Log model architecture
-        model = create_model(config)
-        wandb.watch(model, log="all")
         return True
     except ImportError:
         print("Warning: wandb not installed. Running without experiment tracking.")
@@ -187,8 +193,8 @@ def evaluate_model(model, val_loader, loss_functions, device, config):
     with torch.no_grad():
         for lr_data, hr_data in val_loader:
             # Move data to device
-            lr_data = lr_data.to(device)
-            hr_data = hr_data.to(device)
+            lr_data = lr_data.to(device, non_blocking=True)
+            hr_data = hr_data.to(device, non_blocking=True)
             
             # Forward pass
             output = model(lr_data)
@@ -233,24 +239,54 @@ def train_epoch(model, train_loader, optimizer, loss_functions, device, epoch, c
     total_l1_loss = 0
     total_tv_loss = 0
     
+    # Enable memory efficient attention if available
+    if hasattr(torch, 'set_grad_enabled'):
+        torch.set_grad_enabled(True)
+    
     with tqdm(train_loader, desc=f'Epoch {epoch}') as pbar:
         for batch_idx, (lr_data, hr_data) in enumerate(pbar):
+            # Clear GPU cache periodically
+            if batch_idx % 1 == 0:
+                torch.cuda.empty_cache()
+            
             # Move data to device
-            lr_data = lr_data.to(device)
-            hr_data = hr_data.to(device)
+            lr_data = lr_data.to(device, non_blocking=True)
+            hr_data = hr_data.to(device, non_blocking=True)
+            
+            # Debug input data
+            if torch.isnan(lr_data).any() or torch.isnan(hr_data).any():
+                continue
             
             # Forward pass
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
             output = model(lr_data)
             
             # Calculate losses in log space
             hr_log = torch.log1p(hr_data)
+            
+            # Debug log transform
+            if torch.isnan(hr_log).any():
+                continue
+            
             l1_loss = loss_functions['l1'](output, hr_log)
             tv_loss = loss_functions['tv'](output)
+            
+            # Debug individual losses
+            if torch.isnan(l1_loss).any():
+                continue
+                
+            if torch.isnan(tv_loss).any():
+                continue
+            
             loss = l1_loss + config['loss']['tv_weight'] * tv_loss
+            
+            # Debug final loss
+            if torch.isnan(loss).any():
+                continue
             
             # Backward pass
             loss.backward()
+
             optimizer.step()
             
             # Update progress
@@ -273,6 +309,10 @@ def train_epoch(model, train_loader, optimizer, loss_functions, device, epoch, c
                 except Exception as e:
                     print(f'Wandb logging failed: {e}')
                     pass
+            
+            # Clear some memory after logging
+            del output, l1_loss, tv_loss, loss
+            torch.cuda.empty_cache()
     
     # Calculate average losses
     num_batches = len(train_loader)
@@ -311,6 +351,7 @@ def main():
     model = create_model(config)
     optimizer = create_optimizer(model, config)
     loss_functions = create_loss_functions(config)
+    wandb.watch(model, log="all")
     
     # Training loop
     best_val_loss = float('inf')

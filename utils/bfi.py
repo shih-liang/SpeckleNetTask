@@ -13,6 +13,12 @@ import json
 import gc
 import numpy as np
 
+torch.backends.cudnn.deterministic = True 
+
+def normalize_frame(frame):
+    frame = torch.from_numpy(frame).double() / 16384.0  # Shape: (H, W)
+    return frame
+
 def get_device():
     """Get the device to use for training"""
     if torch.cuda.is_available():
@@ -64,7 +70,7 @@ class VideoFrameDataset(data.Dataset):
     def _get_frame(self, video_id, frame_name):
         # Read and process frame
         frame = cv2.imread(os.path.join(self.ids[video_id], frame_name), cv2.IMREAD_UNCHANGED)
-        frame = torch.from_numpy(frame).float() / 65536.0  # Shape: (H, W)
+        frame = normalize_frame(frame)
         return frame
     
     def __getitem__(self, idx):
@@ -82,16 +88,16 @@ class VideoFrameDataset(data.Dataset):
         return [video_id, start_idx, end_idx], combined.unsqueeze(0)
 
 class DataPreparator:
-    def __init__(self, dataset, batch_size, num_workers, spatiotemporal):
+    def __init__(self, dataset, num_workers, spatiotemporal):
         self.device = get_device()
         self.spatiotemporal = spatiotemporal
-        self.kernel = torch.ones(1, 1, *spatiotemporal, requires_grad=False) / np.prod(spatiotemporal)
+        self.kernel = torch.ones(1, 1, *spatiotemporal, requires_grad=False).double() / np.prod(spatiotemporal)
         self.kernel = self.kernel.to(self.device)
         
         # Initialize DataLoader for efficient batch processing
         self.dataloader = data.DataLoader(
             dataset,
-            batch_size=batch_size,
+            batch_size=1,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,  # Faster data transfer to GPU
@@ -134,20 +140,20 @@ def process_and_save_dataset(input_dir, output_dir, spatiotemporal):
     # Initialize dataset and preparator
     data = gather_video_sequences(input_dir)
     dataset = VideoFrameDataset(data, segment_size=1000 + spatiotemporal[0], time_step=spatiotemporal[0])
-    preparator = DataPreparator(dataset, batch_size=1, num_workers=1, spatiotemporal=spatiotemporal)
+    preparator = DataPreparator(dataset, num_workers=1, spatiotemporal=spatiotemporal)
 
     for idx, batch in tqdm(preparator.get_batch_iterator(), desc="Processing batches"):
-        print(idx, batch.shape)
         processed = preparator.process_batch(batch)
         
-        folder_name = output_path / f"{idx[0]}" / f"{idx[1]}_{idx[2]}"
+        folder_name = output_path / f"{idx[0].item()}"
+        start_idx = idx[1].item()
+        end_idx = idx[2].item()
         folder_name.mkdir(parents=True, exist_ok=True)
+        print(f"Processed video {idx[0].item()} with shape: {processed.shape} and frames: {start_idx} - {end_idx}")
         for i in range(processed.shape[2]):
-            video_file_name = folder_name / f"{i}.npy"
+            video_file_name = folder_name / f"{i + start_idx}.npy"
             tmp = processed[0,0,i].cpu().numpy()
             np.save(video_file_name, tmp)
-        
-        print(idx, processed.shape)
         
         # Clear memory
         del batch

@@ -18,7 +18,7 @@ def center_crop(img: np.ndarray, crop_size: int) -> np.ndarray:
     Raises:
         ValueError: If image is smaller than crop_size
     """
-    h, w = img.shape[:2]
+    h, w = img.shape
     if h < crop_size or w < crop_size:
         raise ValueError(f"Image size ({h}, {w}) is smaller than crop size {crop_size}")
     
@@ -48,7 +48,8 @@ class NumpyFolderDataset(data.Dataset):
         try:
             img = np.load(os.path.join(self.folder_path, self.files[idx]))
             img = center_crop(img, self.crop_size)
-            return torch.from_numpy(img).float()
+            tensor = torch.from_numpy(img).float().unsqueeze(0)
+            return tensor
         except Exception as e:
             print(f"Error loading {self.files[idx]}: {e}")
             # Return a random valid file instead
@@ -67,10 +68,11 @@ class TransformedDataset(data.Dataset):
         item = self.dataset[idx]
         if isinstance(item, tuple):
             # If dataset returns (input, target) pairs
-            return tuple(self.transform(x) for x in item)
+            result = tuple(self.transform(x) for x in item)
         else:
             # If dataset returns single items
-            return self.transform(item)
+            result = self.transform(item)
+        return result
 
 class TemporalPairedDataset(data.Dataset):
     def __init__(self, lr_dataset, lr_temporal, hr_dataset, hr_temporal):
@@ -104,7 +106,6 @@ class RandomPairDataset(data.Dataset):
             hr_data = self.dataset[idx - interval]
         else:
             hr_data = self.dataset[idx]
-
         if random.random() < 0.5:
             return lr_data, hr_data
         else:
