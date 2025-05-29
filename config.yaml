@@ -1,0 +1,34 @@
+data:
+  train_dir: "../Prepared/5x5x5"
+  intervals: # Numbers of frames to use for temporal context
+    - 1
+    - 5
+    - 7
+  val_dir:    # List of validation data directories
+    noise: "../ValidSet/noise"
+    refer: "../ValidSet/refer"
+
+model:
+  in_channels: 1
+  out_channels: 1
+
+training:
+  device: "cuda"  # or "cpu"
+  batch_size: 32
+  num_workers: 16
+  learning_rate: 0.001
+  epochs: 100
+  save_interval: 10
+  checkpoint_dir: "checkpoints"
+  parallel_train: true
+
+loss:
+  alpha: 0.5  # Weight for spatial-temporal loss
+  tv_weight: 0.1  # Weight for gradient loss
+
+wandb:
+  project: "speckle-denoising"  # Your project name
+  name: "0"  # Optional: specific run name
+  tags: []  # Optional: list of tags for this run
+  notes: ""  # Optional: notes about this run
+  log_interval: 10  # Log metrics every N batches 
