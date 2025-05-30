@@ -1,5 +1,5 @@
 data:
-  train_dir: "../Prepared/5x5x5"
+  train_dir: "/mnt/Speckle/Prepared/5x5x5"
   intervals: # Numbers of frames to use for temporal context
     - 1
     - 5

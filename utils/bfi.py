@@ -55,15 +55,25 @@ def gather_video_sequences(root_path):
     return video_sequences
 
 class VideoFrameDataset(data.Dataset):
-    def __init__(self, dataset, segment_size=1024, time_step=5):
-        self.dataset = dataset
+    def __init__(self, data_path, segment_size=1024, time_step=5):
+        self.time_step = time_step
+        self.folder_description = gather_video_sequences(data_path)
         self.segment_size = segment_size
-        self.ids = list(self.dataset.keys())
+        self.ids = list(self.folder_description.keys())
         self.gap = segment_size - time_step + 1
-        self.lengths = [math.ceil(len(self.dataset[i]) / self.gap) for i in self.ids]
+        self.lengths = [self._compute_length(i) for i in self.ids]
         self.cumulative_lengths = np.cumsum(self.lengths)
-        
 
+    def get_data_description(self):
+        return {i: {id: self.folder_description[id]} for i, id in enumerate(self.ids)}
+    
+    def _compute_length(self, video_id):
+        length = len(self.folder_description[self.ids[video_id]])
+        div, mod = divmod(length, self.gap)
+        if mod <= self.time_step:
+            return div
+        return div + 1
+    
     def __len__(self):
         return sum(self.lengths)
     
@@ -77,11 +87,13 @@ class VideoFrameDataset(data.Dataset):
         video_id = bisect.bisect_right(self.cumulative_lengths, idx)
         start_idx = idx - self.cumulative_lengths[video_id - 1] if video_id > 0 else idx
         start_idx = start_idx * self.gap
-        end_idx = min(start_idx + self.segment_size, len(self.dataset[self.ids[video_id]]))
+        end_idx = min(start_idx + self.segment_size, self.lengths[video_id])
+        if end_idx - self.lengths[video_id] <= self.time_step:
+            end_idx = self.lengths[video_id]
         
         # Get frames
         frames = [self._get_frame(video_id, frame_name) 
-                 for frame_name in self.dataset[self.ids[video_id]][start_idx:end_idx]]
+                 for frame_name in self.data_description[self.ids[video_id]][start_idx:end_idx]]
         
         # Stack frames to get (T, H, W)
         combined = torch.stack(frames)
@@ -138,8 +150,7 @@ def process_and_save_dataset(input_dir, output_dir, spatiotemporal):
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Initialize dataset and preparator
-    data = gather_video_sequences(input_dir)
-    dataset = VideoFrameDataset(data, segment_size=1000 + spatiotemporal[0], time_step=spatiotemporal[0])
+    dataset = VideoFrameDataset(input_dir, segment_size=1000 + spatiotemporal[0], time_step=spatiotemporal[0])
     preparator = DataPreparator(dataset, num_workers=1, spatiotemporal=spatiotemporal)
 
     for idx, batch in tqdm(preparator.get_batch_iterator(), desc="Processing batches"):
@@ -163,9 +174,9 @@ def process_and_save_dataset(input_dir, output_dir, spatiotemporal):
     
         print(f"Completed processing {video_file_name}")
 
-    data['video_ids'] = list(enumerate(data.keys()))
+    data_description = dataset.get_data_description()
     with open(output_path / "data_description.json", "w") as f:
-        json.dump(data, f)
+        json.dump(data_description, f)
 
 if __name__ == "__main__":
     input_dir = input("Input directory: ")
