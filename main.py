@@ -351,7 +351,8 @@ def main():
     model = create_model(config)
     optimizer = create_optimizer(model, config)
     loss_functions = create_loss_functions(config)
-    wandb.watch(model, log="all")
+    if wandb_initialized:
+        wandb.watch(model, log="all")
     
     # Training loop
     best_val_loss = float('inf')
