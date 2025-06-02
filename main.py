@@ -3,12 +3,13 @@ from pathlib import Path
 from typing import Dict, Any
 import torch
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 import torch.utils.data as data
 import yaml
 from tqdm import tqdm
-import wandb
 
 from utils.summary import print_model_summary
+from utils.wandb_wrapper import wandb_wrapper
 from datasets.paired import create_train_dataset, create_val_dataset
 from losses import TVLoss, L1Loss
 from models import DenoisingNet
@@ -164,22 +165,24 @@ def create_loss_functions(config):
         'tv': TVLoss(reduction='mean').to(device)
     }
 
-def init_wandb(config: Dict[str, Any]) -> bool:
-    """Initialize Weights & Biases"""
-    try:
-        wandb.init(
-            project=config['wandb']['project'],
-            config=config,
-            name=config['wandb'].get('name', None),
-            tags=config['wandb'].get('tags', []),
-            notes=config['wandb'].get('notes', '')
+def create_scheduler(optimizer, config):
+    """Create and return learning rate scheduler"""
+    scheduler_config = config['training']['scheduler']
+    scheduler_type = scheduler_config['type']
+    
+    if scheduler_type == 'reduce_on_plateau':
+        return lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode=scheduler_config['mode'],
+            factor=scheduler_config['factor'],
+            patience=scheduler_config['patience'],
+            min_lr=scheduler_config['min_lr'],
+            threshold=scheduler_config['threshold'],
+            cooldown=scheduler_config['cooldown'],
+            verbose=True  # Print message when lr is reduced
         )
-        return True
-    except ImportError:
-        print("Warning: wandb not installed. Running without experiment tracking.")
-    except Exception as e:
-        print(f"Warning: Failed to initialize wandb: {e}")
-    return False
+    else:
+        raise ValueError(f"Unknown scheduler type: {scheduler_type}")
 
 def evaluate_model(model, val_loader, loss_functions, device, config):
     """Evaluate model performance by computing various metrics"""
@@ -295,20 +298,17 @@ def train_epoch(model, train_loader, optimizer, loss_functions, device, epoch, c
             total_tv_loss += tv_loss.item()
             
             current_loss = total_loss / (batch_idx + 1)
-            pbar.set_postfix({'loss': current_loss})
+            current_lr = optimizer.param_groups[0]['lr']
+            pbar.set_postfix({'loss': current_loss, 'lr': current_lr})
             
-            # Log batch metrics if wandb is available
-            if 'wandb' in config and batch_idx % config['wandb']['log_interval'] == 0:
-                try:
-                    wandb.log({
-                        'batch/loss': loss.item(),
-                        'batch/l1_loss': l1_loss.item(),
-                        'batch/tv_loss': tv_loss.item(),
-                        'batch/learning_rate': optimizer.param_groups[0]['lr']
-                    })
-                except Exception as e:
-                    print(f'Wandb logging failed: {e}')
-                    pass
+            # Log batch metrics
+            if batch_idx % config['wandb']['log_interval'] == 0:
+                wandb_wrapper.log({
+                    'batch/loss': loss.item(),
+                    'batch/l1_loss': l1_loss.item(),
+                    'batch/tv_loss': tv_loss.item(),
+                    'batch/learning_rate': current_lr
+                })
             
             # Clear some memory after logging
             del output, l1_loss, tv_loss, loss
@@ -342,17 +342,17 @@ def main():
     # Load configuration
     config = load_config('config.yaml')
     
-    # Initialize wandb (optional)
-    wandb_initialized = init_wandb(config)
-    
     # Setup
     setup_directories(config)
     train_loader, val_loader = create_dataloaders(config)
     model = create_model(config)
     optimizer = create_optimizer(model, config)
+    scheduler = create_scheduler(optimizer, config)
     loss_functions = create_loss_functions(config)
-    if wandb_initialized:
-        wandb.watch(model, log="all")
+    
+    # Initialize wandb and watch model
+    wandb_wrapper.init(config)
+    wandb_wrapper.watch(model, log="all")
     
     # Training loop
     best_val_loss = float('inf')
@@ -370,19 +370,16 @@ def main():
             config['training']['device'], config
         )
         
-        # Log metrics if wandb is available
-        if wandb_initialized:
-            log = {
-                    'epoch': epoch,
-                    **train_metrics,
-                    **val_metrics,
-                    'epoch/learning_rate': optimizer.param_groups[0]['lr']
-                }
-            try:
-                wandb.log(log)
-            except Exception as e:
-                print(f'Wandb logging {log} failed: {e}')
-                pass
+        # Update learning rate based on validation loss
+        scheduler.step(val_metrics['val_loss'])
+        
+        # Log metrics
+        wandb_wrapper.log({
+            'epoch': epoch,
+            **train_metrics,
+            **val_metrics,
+            'epoch/learning_rate': optimizer.param_groups[0]['lr']
+        })
         
         # Save checkpoint if validation metrics improved
         if val_metrics['val_loss'] < best_val_loss or val_metrics['val_psnr'] > best_val_psnr:
@@ -391,26 +388,18 @@ def main():
             if val_metrics['val_psnr'] > best_val_psnr:
                 best_val_psnr = val_metrics['val_psnr']
             
+            checkpoint_path = Path(config['training']['checkpoint_dir']) / f'checkpoint_epoch_{epoch}.pt'
             save_checkpoint(model, optimizer, epoch, val_metrics['val_loss'], config)
-            if wandb_initialized:
-                try:
-                    wandb.save(str(Path(config['training']['checkpoint_dir']) / f'checkpoint_epoch_{epoch}.pt'))
-                except Exception as e:
-                    print('Wandb save failed: ', e)
-                    pass
+            wandb_wrapper.save(str(checkpoint_path))
         
         # Print epoch results
         print(f'Epoch {epoch + 1}/{config["training"]["epochs"]}')
         print(f'Train Loss: {train_metrics["train_loss"]:.4f}, Val Loss: {val_metrics["val_loss"]:.4f}')
         print(f'Val PSNR: {val_metrics["val_psnr"]:.2f} dB')
+        print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
     
-    # Close wandb if it was initialized
-    if wandb_initialized:
-        try:
-            wandb.finish()
-        except Exception as e:
-            print('Wandb finish failed: ', e)
-            pass
+    # Close wandb
+    wandb_wrapper.finish()
 
 if __name__ == '__main__':
     main() 

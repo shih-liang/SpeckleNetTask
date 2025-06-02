@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import torch.utils.data as data
+import cv2
 
 def center_crop(img: np.ndarray, crop_size: int) -> np.ndarray:
     """Center crop an image to the specified size.
@@ -25,6 +26,75 @@ def center_crop(img: np.ndarray, crop_size: int) -> np.ndarray:
     start_h = (h - crop_size) // 2
     start_w = (w - crop_size) // 2
     return img[start_h:start_h+crop_size, start_w:start_w+crop_size]
+
+class ImageFolderDataset(data.Dataset):
+    """Dataset for loading image files (TIFF, PNG, etc.) from a folder.
+    
+    This dataset loads images from a folder and applies center cropping.
+    It supports various image formats including TIFF, PNG, and JPEG.
+    
+    Args:
+        folder_path (str): Path to folder containing image files
+        crop_size (int): Size of center crop
+        image_type (str): Type of image to load ('grayscale' or 'color')
+    """
+    def __init__(self, folder_path: str, crop_size: int = 512, image_type: str = 'grayscale'):
+        """Initialize dataset with center cropping.
+        
+        Args:
+            folder_path (str): Path to folder containing image files
+            crop_size (int): Size of center crop
+            image_type (str): Type of image to load ('grayscale' or 'color')
+        """
+        self.folder_path = folder_path
+        self.crop_size = crop_size
+        self.image_type = image_type
+        
+        # Get all image files
+        self.files = []
+        for f in os.listdir(folder_path):
+            if f.lower().endswith(('.tiff', '.tif', '.png', '.jpg', '.jpeg')):
+                self.files.append(f)
+        self.files.sort()
+        
+        if not self.files:
+            raise ValueError(f"No image files found in {folder_path}")
+        
+        print(f"Found {len(self.files)} images in {folder_path}")
+
+    def __len__(self):
+        return len(self.files)
+    
+    def __getitem__(self, idx):
+        try:
+            # Read image
+            img_path = os.path.join(self.folder_path, self.files[idx])
+            if self.image_type == 'grayscale':
+                img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    raise ValueError(f"Failed to load image: {img_path}")
+            else:  # color
+                img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+                if img is None:
+                    raise ValueError(f"Failed to load image: {img_path}")
+            
+            # Normalize to [0, 1]
+            if img.dtype == np.uint16:
+                img = img.astype(np.float32) / 65535.0
+            elif img.dtype == np.uint8:
+                img = img.astype(np.float32) / 255.0
+            
+            # Center crop
+            img = center_crop(img, self.crop_size)
+            
+            # Convert to tensor
+            tensor = torch.from_numpy(img).float().unsqueeze(0)
+            return tensor
+            
+        except Exception as e:
+            print(f"Error loading {self.files[idx]}: {e}")
+            # Return a random valid file instead
+            return self.__getitem__(random.randint(0, len(self) - 1))
 
 class NumpyFolderDataset(data.Dataset):
     def __init__(self, folder_path: str, crop_size: int = 512):
@@ -128,10 +198,11 @@ def create_train_dataset(train_dir, intervals):
     return dataset
 
 def create_val_dataset(noise_dir, refer_dir):
+    """Create validation dataset using ImageFolderDataset for TIFF files"""
     # Create dataset
     dataset = TemporalPairedDataset(
-        lr_dataset=TransformedDataset(NumpyFolderDataset(noise_dir), torch.log1p),
-        hr_dataset=NumpyFolderDataset(refer_dir),
+        lr_dataset=TransformedDataset(ImageFolderDataset(noise_dir), torch.log1p),
+        hr_dataset=ImageFolderDataset(refer_dir),
         lr_temporal=1,
         hr_temporal=1
     )
