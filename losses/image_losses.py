@@ -16,7 +16,7 @@ class TVLoss(nn.Module):
         """Calculate Total Variation Loss.
         
         Args:
-            x (torch.Tensor): Input tensor of shape (B, C, H, W)
+            x (torch.Tensor): Predicted tensor of shape (B, C, H, W)
             
         Returns:
             torch.Tensor: TV loss value
@@ -26,8 +26,10 @@ class TVLoss(nn.Module):
         w_tv = torch.pow(x[:,:,:,1:] - x[:,:,:,:-1], 2).sum()
         
         if self.reduction == 'mean':
-            return (h_tv + w_tv) / batch_size
-        return h_tv + w_tv
+            loss = (h_tv + w_tv) / batch_size
+        else:
+            loss = h_tv + w_tv
+        return loss
 
 class L1Loss(nn.Module):
     """L1 Loss (Mean Absolute Error) with optional reduction.

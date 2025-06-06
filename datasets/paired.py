@@ -60,7 +60,6 @@ class ImageFolderDataset(data.Dataset):
         if not self.files:
             raise ValueError(f"No image files found in {folder_path}")
         
-        print(f"Found {len(self.files)} images in {folder_path}")
 
     def __len__(self):
         return len(self.files)

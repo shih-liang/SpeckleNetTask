@@ -1,405 +1,290 @@
+"""Main training script for DWConv model.
+
+This script handles the training process using distributed data parallelism.
+"""
+
 import os
-from pathlib import Path
-from typing import Dict, Any
 import torch
-import torch.optim as optim
-import torch.optim.lr_scheduler as lr_scheduler
-import torch.utils.data as data
-import yaml
+import torch.multiprocessing as mp
+from typing import Dict, Any
+import argparse
 from tqdm import tqdm
+from metrics.psnr import calculate_batch_psnr
+import json
+import matplotlib.pyplot as plt
+import numpy as np
 
-from utils.summary import print_model_summary
-from utils.wandb_wrapper import wandb_wrapper
-from datasets.paired import create_train_dataset, create_val_dataset
-from losses import TVLoss, L1Loss
-from models import DenoisingNet
-from metrics import calculate_batch_psnr
+from utils.config import Config
+from utils.setup import TrainingSetup, ValidationSetup
 
-def validate_config(config: Dict[str, Any]) -> None:
-    """Validate configuration parameters"""
-    required_sections = ['data', 'model', 'training', 'loss']
-    for section in required_sections:
-        if section not in config:
-            raise ValueError(f"Missing required section '{section}' in config")
-    
-    # Validate data section
-    data_config = config['data']
-    required_data = ['train_dir', 'val_dir', 'intervals']
-    for param in required_data:
-        if param not in data_config:
-            raise ValueError(f"Missing required parameter '{param}' in data section")
-    
-    # Validate val_dir structure
-    val_dir = data_config['val_dir']
-    if not isinstance(val_dir, dict) or 'noise' not in val_dir or 'refer' not in val_dir:
-        raise ValueError("val_dir must be a dictionary with 'noise' and 'refer' keys")
-    
-    # Validate training section
-    training_config = config['training']
-    required_training = ['device', 'batch_size', 'num_workers', 'learning_rate', 
-                        'epochs', 'save_interval', 'checkpoint_dir']
-    for param in required_training:
-        if param not in training_config:
-            raise ValueError(f"Missing required parameter '{param}' in training section")
-    
-    # Validate model section
-    model_config = config['model']
-    required_model = ['in_channels', 'out_channels']
-    for param in required_model:
-        if param not in model_config:
-            raise ValueError(f"Missing required parameter '{param}' in model section")
-    
-    # Validate loss section
-    loss_config = config['loss']
-    required_loss = ['tv_weight']
-    for param in required_loss:
-        if param not in loss_config:
-            raise ValueError(f"Missing required parameter '{param}' in loss section")
-    
-    # Validate wandb section if present
-    if 'wandb' in config:
-        wandb_config = config['wandb']
-        required_wandb = ['project', 'log_interval']
-        for param in required_wandb:
-            if param not in wandb_config:
-                raise ValueError(f"Missing required parameter '{param}' in wandb section")
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load and validate configuration from YAML file with environment variable support"""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Replace environment variables
-    def replace_env_vars(value: Any) -> Any:
-        if isinstance(value, str) and value.startswith('${') and value.endswith('}'):
-            env_var = value[2:-1]
-            return os.getenv(env_var)
-        return value
-    
-    def process_dict(d: Dict[str, Any]) -> Dict[str, Any]:
-        return {k: process_value(v) for k, v in d.items()}
-    
-    def process_value(v: Any) -> Any:
-        if isinstance(v, dict):
-            return process_dict(v)
-        elif isinstance(v, list):
-            return [process_value(item) for item in v]
+def _validate(model, dataloader, criterion, device, rank: int, im_output=False):
+    try:
+        # Run testing
+        model.eval()
+        total_loss = 0
+        total_psnr = 0
+        total_psnr_std = 0
+        num_batches = 0
+        
+        # Save all outputs and metrics
+        if im_output:
+            all_outputs = []
+            all_targets = []
+        all_metrics = []
+        
+        with torch.no_grad():
+            with tqdm(dataloader, desc='Validation',
+                     disable=rank != 0) as pbar:
+                for batch_idx, (noise, target) in enumerate(pbar):
+                    noise, target = noise.to(device), target.to(device)
+                    
+                    # Forward pass
+                    output = model(noise)
+                    target_log = torch.log1p(target)
+                    loss = criterion(output, target_log)
+                    
+                    # Calculate PSNR
+                    # Convert from log space to original space for PSNR calculation
+                    output_exp = torch.expm1(output)
+                    batch_psnr_mean, batch_psnr_std = calculate_batch_psnr(output_exp, target)
+                    
+                    # Update metrics
+                    total_loss += loss.item()
+                    total_psnr += batch_psnr_mean
+                    total_psnr_std += batch_psnr_std
+                    num_batches += 1
+                    
+                    # Store outputs and targets
+                    if im_output:
+                        all_outputs.append(output_exp.cpu())
+                        all_targets.append(target.cpu())
+
+                    all_metrics.append({
+                        'batch_idx': batch_idx,
+                        'loss': loss.item(),
+                        'psnr': batch_psnr_mean,
+                        'psnr_std': batch_psnr_std
+                    })
+                    
+                    if rank == 0:
+                        pbar.set_postfix({
+                            'loss': loss.item(),
+                            'psnr': batch_psnr_mean
+                        })
+        
+        # Calculate average metrics
+        avg_loss = total_loss / num_batches
+        avg_psnr = total_psnr / num_batches
+        avg_psnr_std = total_psnr_std / num_batches
+
+        metrics = {
+            'average_metrics': {
+                'loss': avg_loss,
+                'psnr': avg_psnr,
+                'psnr_std': avg_psnr_std
+            },
+            'per_batch_metrics': all_metrics
+        }
+        
+        if im_output:
+            return metrics, all_outputs, all_targets
         else:
-            return replace_env_vars(v)
+            return metrics
     
-    config = process_dict(config)
-    validate_config(config)
-    return config
+    except Exception as e:
+        print(f"Error in validation process {rank}: {str(e)}")
+        raise e
 
-def setup_directories(config):
-    """Create necessary directories"""
-    # Create checkpoint directory
-    Path(config['training']['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
-    
-def create_dataloaders(config):
-    """Create and return dataloaders"""
-    # Create training dataset
-    train_dataset = create_train_dataset(
-        config['data']['train_dir'],
-        config['data']['intervals']
-    )
-    
-    # Create validation dataset
-    val_dataset = create_val_dataset(
-        config['data']['val_dir']['noise'],
-        config['data']['val_dir']['refer']
-    )
-    
-    # Create dataloaders with memory optimizations
-    train_loader = data.DataLoader(
-        train_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=True,
-        num_workers=config['training']['num_workers'],
-        pin_memory=True,
-        persistent_workers=True,  # Keep workers alive between epochs
-        prefetch_factor=1,  # Number of batches loaded in advance by each worker
-        drop_last=True  # Drop incomplete batches to avoid memory issues
-    )
-    
-    val_loader = data.DataLoader(
-        val_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=False,
-        num_workers=config['training']['num_workers'],
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=1,
-        drop_last=True
-    )
-    
-    return train_loader, val_loader
 
-def create_model(config):
-    """Create and return model"""
-    device = torch.device(config['training']['device'])
-    model = DenoisingNet(
-        in_channels=config['model']['in_channels'],
-        out_channels=config['model']['out_channels'],
-        hidden_channels=16,
-        scales=[3,5,7,13,17]
-    )
-    model = model.to(device)  # Move model to the specified device
-    if config['training']['parallel_train']:
-        model = torch.nn.DataParallel(model)
-    print_model_summary(model, device, (config['model']['in_channels'], 512, 512))
-    return model
-
-def create_optimizer(model, config):
-    """Create and return optimizer"""
-    return optim.Adam(
-        model.parameters(),
-        lr=config['training']['learning_rate']
-    )
-
-def create_loss_functions(config):
-    """Create and return loss functions"""
-    device = torch.device(config['training']['device'])
-    return {
-        'l1': L1Loss(reduction='mean').to(device),
-        'tv': TVLoss(reduction='mean').to(device)
-    }
-
-def create_scheduler(optimizer, config):
-    """Create and return learning rate scheduler"""
-    scheduler_config = config['training']['scheduler']
-    scheduler_type = scheduler_config['type']
+def train(rank: int, world_size: int, config: Dict[str, Any]) -> None:
+    """Training process for a single GPU"""
+    setup = None
+    try:
+        # Initialize training setup
+        setup = TrainingSetup(config, rank, world_size)
     
-    if scheduler_type == 'reduce_on_plateau':
-        return lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode=scheduler_config['mode'],
-            factor=scheduler_config['factor'],
-            patience=scheduler_config['patience'],
-            min_lr=scheduler_config['min_lr'],
-            threshold=scheduler_config['threshold'],
-            cooldown=scheduler_config['cooldown'],
-            verbose=True  # Print message when lr is reduced
-        )
-    else:
-        raise ValueError(f"Unknown scheduler type: {scheduler_type}")
-
-def evaluate_model(model, val_loader, loss_functions, device, config):
-    """Evaluate model performance by computing various metrics"""
-    model.eval()
-    total_loss = 0
-    total_l1_loss = 0
-    total_tv_loss = 0
-    total_psnr = 0
-    total_psnr_std = 0
+        # Training loop
+        for epoch in range(config['training']['epochs']):
+            if world_size > 1:
+                setup.train_loader.sampler.set_epoch(epoch)
     
-    with torch.no_grad():
-        for lr_data, hr_data in val_loader:
-            # Move data to device
-            lr_data = lr_data.to(device, non_blocking=True)
-            hr_data = hr_data.to(device, non_blocking=True)
+            # Training phase
+            setup.model.train()
+            total_loss = 0
             
-            # Forward pass
-            output = model(lr_data)
-            
-            # Calculate losses in log space
-            hr_log = torch.log1p(hr_data)
-            l1_loss = loss_functions['l1'](output, hr_log)
-            tv_loss = loss_functions['tv'](output)
-            loss = l1_loss + config['loss']['tv_weight'] * tv_loss
-            
-            # Calculate PSNR in original space
-            exp_output = torch.expm1(output)
-            batch_psnr_mean, batch_psnr_std = calculate_batch_psnr(exp_output, hr_data)
-            
-            # Accumulate metrics
-            total_loss += loss.item()
-            total_l1_loss += l1_loss.item()
-            total_tv_loss += tv_loss.item()
-            total_psnr += batch_psnr_mean
-            total_psnr_std += batch_psnr_std
+            with tqdm(setup.train_loader, desc=f'Epoch {epoch + 1}/{config["training"]["epochs"]} [Train]',
+                     disable=rank != 0) as pbar:
+                for batch_idx, (noise, target) in enumerate(pbar):
+                    noise, target = noise.to(setup.device), target.to(setup.device)
     
-    # Calculate average metrics
-    num_batches = len(val_loader)
-    avg_loss = total_loss / num_batches
-    avg_l1_loss = total_l1_loss / num_batches
-    avg_tv_loss = total_tv_loss / num_batches
-    avg_psnr = total_psnr / num_batches
-    avg_psnr_std = total_psnr_std / num_batches
+                    # Forward pass
+                    setup.optimizer.zero_grad()
+                    output = setup.model(noise)
+                    loss = setup.criterion(output, target)
     
-    return {
-        'val_loss': avg_loss,
-        'val_l1_loss': avg_l1_loss,
-        'val_tv_loss': avg_tv_loss,
-        'val_psnr': avg_psnr,
-        'val_psnr_std': avg_psnr_std
-    }
-
-def train_epoch(model, train_loader, optimizer, loss_functions, device, epoch, config):
-    """Train for one epoch"""
-    model.train()
-    total_loss = 0
-    total_l1_loss = 0
-    total_tv_loss = 0
+                    # Backward pass
+                    loss.backward()
+                    setup.optimizer.step()
     
-    # Enable memory efficient attention if available
-    if hasattr(torch, 'set_grad_enabled'):
-        torch.set_grad_enabled(True)
+                    # Update metrics
+                    total_loss += loss.item()
+                    if rank == 0:
+                        pbar.set_postfix({'loss': loss.item()})
+            
+            avg_train_loss = total_loss / len(setup.train_loader)
     
-    with tqdm(train_loader, desc=f'Epoch {epoch}') as pbar:
-        for batch_idx, (lr_data, hr_data) in enumerate(pbar):
-            # Clear GPU cache periodically
-            if batch_idx % 1 == 0:
-                torch.cuda.empty_cache()
-            
-            # Move data to device
-            lr_data = lr_data.to(device, non_blocking=True)
-            hr_data = hr_data.to(device, non_blocking=True)
-            
-            # Debug input data
-            if torch.isnan(lr_data).any() or torch.isnan(hr_data).any():
-                continue
-            
-            # Forward pass
-            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
-            output = model(lr_data)
-            
-            # Calculate losses in log space
-            hr_log = torch.log1p(hr_data)
-            
-            # Debug log transform
-            if torch.isnan(hr_log).any():
-                continue
-            
-            l1_loss = loss_functions['l1'](output, hr_log)
-            tv_loss = loss_functions['tv'](output)
-            
-            # Debug individual losses
-            if torch.isnan(l1_loss).any():
-                continue
+            # Validation phase
+            metrics = _validate(setup.model, setup.val_loader, setup.criterion, setup.device, rank, im_output=False)
+    
+            # Log metrics
+            if rank == 0:
+                if setup.wandb is not None:
+                    setup.wandb.log({
+                        'epoch': epoch,
+                        'train_loss': avg_train_loss,
+                        'val_loss': metrics
+                    })
                 
-            if torch.isnan(tv_loss).any():
-                continue
-            
-            loss = l1_loss + config['loss']['tv_weight'] * tv_loss
-            
-            # Debug final loss
-            if torch.isnan(loss).any():
-                continue
-            
-            # Backward pass
-            loss.backward()
+                # Save checkpoint
+                if (epoch + 1) % config['training']['save_interval'] == 0:
+                    checkpoint = {
+                        'epoch': epoch,
+                        'model_state_dict': setup.model.module.state_dict() if isinstance(setup.model, torch.nn.parallel.DistributedDataParallel) else setup.model.state_dict(),
+                        'optimizer_state_dict': setup.optimizer.state_dict(),
+                        'config': config
+                    }
+                    
+                    checkpoint_path = os.path.join(
+                        config['training']['checkpoint_dir'],
+                        f'checkpoint_epoch_{epoch + 1}.pt'
+                    )
+                    
+                    torch.save(checkpoint, checkpoint_path)
+                
+                print(f'Epoch {epoch + 1}/{config["training"]["epochs"]}')
+                print(f'Train Loss: {avg_train_loss:.4f}, Val Loss: {metrics["average_metrics"]["loss"]:.4f}')
+        
+    except Exception as e:
+        print(f"Error in training process {rank}: {str(e)}")
+        raise e
+    finally:
+        # Cleanup
+        if setup is not None:
+            setup.cleanup()
 
-            optimizer.step()
+def test(rank: int, world_size: int, config: Dict[str, Any], checkpoint_path: str) -> None:
+    """Test process for a single GPU"""
+    setup = None
+    try:
+        # Initialize validation setup
+        setup = ValidationSetup(config, rank, world_size)
+        
+        # Load checkpoint
+        if rank == 0:
+            print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=f'cuda:{rank}')
+        setup.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Create output directories if they don't exist
+        output_dir = os.path.join(config['training']['checkpoint_dir'], 'test_outputs')
+        images_dir = os.path.join(output_dir, 'images')
+        if rank == 0:
+            os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(images_dir, exist_ok=True)
+        
+        metrics, all_outputs, all_targets = _validate(setup.model, setup.val_loader, setup.criterion, setup.device, rank, im_output=True)
+        
+        # Save results on rank 0
+        if rank == 0:
+            # Save metrics to JSON
+            metrics_path = os.path.join(output_dir, 'test_metrics.json')
+            with open(metrics_path, 'w') as f:
+                json.dump(metrics, f, indent=4)
             
-            # Update progress
-            total_loss += loss.item()
-            total_l1_loss += l1_loss.item()
-            total_tv_loss += tv_loss.item()
+            # Save model outputs and targets
+            for batch_idx, (output_imgs, target_imgs) in enumerate(zip(all_outputs, all_targets)):
+                batch_size = output_imgs.size(0)
+                for img_idx in range(batch_size):
+                    # Get the output and target images
+                    output_img = output_imgs[img_idx].cpu()
+                    target_img = target_imgs[img_idx].cpu()
+                            
+                    # Create a figure with two subplots
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+                    
+                    # Plot output image
+                    ax1.imshow(output_img.permute(1, 2, 0).numpy())
+                    ax1.set_title('Model Output')
+                    ax1.axis('off')
+                    
+                    # Plot target image
+                    ax2.imshow(target_img.permute(1, 2, 0).numpy())
+                    ax2.set_title('Target')
+                    ax2.axis('off')
+                    
+                    # Save the figure
+                    img_path = os.path.join(images_dir, f'batch_{batch_idx}_img_{img_idx}.png')
+                    plt.savefig(img_path, bbox_inches='tight', pad_inches=0.1)
+                    plt.close()
             
-            current_loss = total_loss / (batch_idx + 1)
-            current_lr = optimizer.param_groups[0]['lr']
-            pbar.set_postfix({'loss': current_loss, 'lr': current_lr})
+            print("\nTest Results:")
+            print(f"Validation Loss: {metrics['average_metrics']['loss']:.4f}")
+            print(f"PSNR: {metrics['average_metrics']['psnr']:.2f} ± {metrics['average_metrics']['psnr_std']:.2f} dB")
+            print(f"\nResults saved to {output_dir}")
             
-            # Log batch metrics
-            if batch_idx % config['wandb']['log_interval'] == 0:
-                wandb_wrapper.log({
-                    'batch/loss': loss.item(),
-                    'batch/l1_loss': l1_loss.item(),
-                    'batch/tv_loss': tv_loss.item(),
-                    'batch/learning_rate': current_lr
-                })
-            
-            # Clear some memory after logging
-            del output, l1_loss, tv_loss, loss
-            torch.cuda.empty_cache()
-    
-    # Calculate average losses
-    num_batches = len(train_loader)
-    avg_loss = total_loss / num_batches
-    avg_l1_loss = total_l1_loss / num_batches
-    avg_tv_loss = total_tv_loss / num_batches
-    
-    return {
-        'train_loss': avg_loss,
-        'train_l1_loss': avg_l1_loss,
-        'train_tv_loss': avg_tv_loss
-    }
-
-def save_checkpoint(model, optimizer, epoch, loss, config):
-    """Save model checkpoint"""
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss
-    }
-    
-    checkpoint_path = Path(config['training']['checkpoint_dir']) / f'checkpoint_epoch_{epoch}.pt'
-    torch.save(checkpoint, checkpoint_path)
+    except Exception as e:
+        print(f"Error in test process {rank}: {str(e)}")
+        raise e
+    finally:
+        # Cleanup
+        if setup is not None:
+            setup.cleanup()
 
 def main():
+    """Main entry point"""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Train or test the DWConv model')
+    parser.add_argument('--mode', type=str, choices=['train', 'test'], default='train',
+                      help='Mode to run the script in (train or test)')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                      help='Path to checkpoint file for testing mode')
+    args = parser.parse_args()
+    
     # Load configuration
-    config = load_config('config.yaml')
+    config_manager = Config('config.yaml')
+    config = config_manager.config
     
-    # Setup
-    setup_directories(config)
-    train_loader, val_loader = create_dataloaders(config)
-    model = create_model(config)
-    optimizer = create_optimizer(model, config)
-    scheduler = create_scheduler(optimizer, config)
-    loss_functions = create_loss_functions(config)
+    # Get number of available GPUs
+    world_size = torch.cuda.device_count()
     
-    # Initialize wandb and watch model
-    wandb_wrapper.init(config)
-    wandb_wrapper.watch(model, log="all")
-    
-    # Training loop
-    best_val_loss = float('inf')
-    best_val_psnr = 0.0  # Track best PSNR
-    for epoch in range(config['training']['epochs']):
-        # Train epoch
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, loss_functions,
-            config['training']['device'], epoch, config
-        )
-        
-        # Evaluate model
-        val_metrics = evaluate_model(
-            model, val_loader, loss_functions,
-            config['training']['device'], config
-        )
-        
-        # Update learning rate based on validation loss
-        scheduler.step(val_metrics['val_loss'])
-        
-        # Log metrics
-        wandb_wrapper.log({
-            'epoch': epoch,
-            **train_metrics,
-            **val_metrics,
-            'epoch/learning_rate': optimizer.param_groups[0]['lr']
-        })
-        
-        # Save checkpoint if validation metrics improved
-        if val_metrics['val_loss'] < best_val_loss or val_metrics['val_psnr'] > best_val_psnr:
-            if val_metrics['val_loss'] < best_val_loss:
-                best_val_loss = val_metrics['val_loss']
-            if val_metrics['val_psnr'] > best_val_psnr:
-                best_val_psnr = val_metrics['val_psnr']
+    if args.mode == 'train':
+        if world_size > 1:
+            # Use distributed training
+            mp.spawn(
+                train,
+                args=(world_size, config),
+                nprocs=world_size,
+                join=True
+            )
+        else:
+            # Single GPU training
+            train(0, 1, config)
+    else:  # test mode
+        if args.checkpoint is None:
+            raise ValueError("Checkpoint path must be provided for test mode")
             
-            checkpoint_path = Path(config['training']['checkpoint_dir']) / f'checkpoint_epoch_{epoch}.pt'
-            save_checkpoint(model, optimizer, epoch, val_metrics['val_loss'], config)
-            wandb_wrapper.save(str(checkpoint_path))
-        
-        # Print epoch results
-        print(f'Epoch {epoch + 1}/{config["training"]["epochs"]}')
-        print(f'Train Loss: {train_metrics["train_loss"]:.4f}, Val Loss: {val_metrics["val_loss"]:.4f}')
-        print(f'Val PSNR: {val_metrics["val_psnr"]:.2f} dB')
-        print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
-    
-    # Close wandb
-    wandb_wrapper.finish()
+        if world_size > 1:
+            # Use distributed testing
+            mp.spawn(
+                test,
+                args=(world_size, config, args.checkpoint),
+                nprocs=world_size,
+                join=True
+            )
+        else:
+            # Single GPU testing
+            test(0, 1, config, args.checkpoint)
 
 if __name__ == '__main__':
     main() 
