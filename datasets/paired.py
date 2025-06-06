@@ -68,20 +68,8 @@ class ImageFolderDataset(data.Dataset):
         try:
             # Read image
             img_path = os.path.join(self.folder_path, self.files[idx])
-            if self.image_type == 'grayscale':
-                img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-                if img is None:
-                    raise ValueError(f"Failed to load image: {img_path}")
-            else:  # color
-                img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-                if img is None:
-                    raise ValueError(f"Failed to load image: {img_path}")
-            
-            # Normalize to [0, 1]
-            if img.dtype == np.uint16:
-                img = img.astype(np.float32) / 65535.0
-            elif img.dtype == np.uint8:
-                img = img.astype(np.float32) / 255.0
+            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            img = img.astype(np.float32) / 16384.0
             
             # Center crop
             img = center_crop(img, self.crop_size)

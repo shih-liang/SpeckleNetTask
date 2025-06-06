@@ -132,38 +132,37 @@ def train(rank: int, world_size: int, config: Dict[str, Any]) -> None:
                     if rank == 0:
                         pbar.set_postfix({'loss': loss.item()})
             
-            avg_train_loss = total_loss / len(setup.train_loader)
-    
-            # Validation phase
-            metrics = _validate(setup.model, setup.val_loader, setup.criterion, setup.device, rank, im_output=False)
-    
-            # Log metrics
-            if rank == 0:
-                if setup.wandb is not None:
-                    setup.wandb.log({
-                        'epoch': epoch,
-                        'train_loss': avg_train_loss,
-                        'val_loss': metrics
-                    })
+                    if batch_idx % config['training']['val_interval'] == 0:
+                        # Validation phase
+                        metrics = _validate(setup.model, setup.val_loader, setup.criterion, setup.device, rank, im_output=False)
                 
-                # Save checkpoint
-                if (epoch + 1) % config['training']['save_interval'] == 0:
-                    checkpoint = {
-                        'epoch': epoch,
-                        'model_state_dict': setup.model.module.state_dict() if isinstance(setup.model, torch.nn.parallel.DistributedDataParallel) else setup.model.state_dict(),
-                        'optimizer_state_dict': setup.optimizer.state_dict(),
-                        'config': config
-                    }
-                    
-                    checkpoint_path = os.path.join(
-                        config['training']['checkpoint_dir'],
-                        f'checkpoint_epoch_{epoch + 1}.pt'
-                    )
-                    
-                    torch.save(checkpoint, checkpoint_path)
+                        # Log metrics
+                        if rank == 0:
+                            if setup.wandb is not None:
+                                setup.wandb.log({
+                                    'epoch': epoch,
+                                    'train_loss': total_loss / len(setup.train_loader),
+                                    'val_loss': metrics['average_metrics']['loss']
+                                })
+                
+            # Save checkpoint
+            if rank == 0 and (epoch + 1) % config['training']['save_interval'] == 0:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': setup.model.module.state_dict() if isinstance(setup.model, torch.nn.parallel.DistributedDataParallel) else setup.model.state_dict(),
+                    'optimizer_state_dict': setup.optimizer.state_dict(),
+                    'config': config
+                }
+                
+                checkpoint_path = os.path.join(
+                    config['training']['checkpoint_dir'],
+                    f'checkpoint_epoch_{epoch + 1}.pt'
+                )
+                
+                torch.save(checkpoint, checkpoint_path)
                 
                 print(f'Epoch {epoch + 1}/{config["training"]["epochs"]}')
-                print(f'Train Loss: {avg_train_loss:.4f}, Val Loss: {metrics["average_metrics"]["loss"]:.4f}')
+                print(f'Train Loss: {total_loss / len(setup.train_loader):.4f}, Val Loss: {metrics["average_metrics"]["loss"]:.4f}')
         
     except Exception as e:
         print(f"Error in training process {rank}: {str(e)}")

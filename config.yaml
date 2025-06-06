@@ -19,6 +19,7 @@ training:
   learning_rate: 0.001
   epochs: 1
   save_interval: 1
+  val_interval: 100
   checkpoint_dir: "checkpoints"
   parallel_train: false
   scheduler:
